@@ -1,0 +1,295 @@
+---
+title: "League of Legends Win-Rate Modelling"
+author: Andrew Suter
+date: "Last Updated: `r Sys.Date()`"
+output:
+    bookdown::html_document2:
+        highlight: tango
+        toc: true
+        theme: united
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+library(reticulate)
+library(DT)
+library(skimr)
+```
+# Write-Up {-}
+
+This project has two parts:
+
+1. Accessing Riot Game's API to Gather the Data.
+2. Using the data, try to predict whether a game will be won or lost.
+
+# Gathering {-}
+
+This was my first project I used APIs to gather data from systems! When building my script I utilized:
+
+- [cassiopeia](https://github.com/meraki-analytics/cassiopeia)
+- [riotwatcher](https://github.com/pseudonym117/Riot-Watcher)
+
+These python packages are wrappers for the Riot Games API. I used these as I was unfamiliar with calling APIs and these
+    wrappers made it very easy to gather my data!
+
+Using the Riot API and the Cassiopeia python Library, I was able to collect around 17000 match entries from the KR, EUW, and NA servers. All of these matches were from the Challenger division.
+
+The data collection process is one of the most important steps to any future analysis, therefore I used random sampling as well as only gathering one participant of 10 from every match to ensure independence for my entries.
+
+The process went as follows: I gathered all of the regions’ challenger players, got each players’ most recent 20 games, and randomly selected one player (does not have to be the player in question) from each match to add to my data. I also ensured the match_id was never used twice between any players’ match histories.
+
+# Analysis {-}
+
+## Project Statement {-}
+
+Using logistic regression and decision trees to predict LoL game outcomes by role. Also determine what variables add most value to these models (ie factor that causes the most gain)
+
+
+## North America {-}
+
+Below are the features we will consider in our model development!
+
+![](2022_january_1/assets/vardesc.jpg)
+
+```{python load data, echo=FALSE, warning=FALSE, results='hide'}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import Image
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+sns.set_style('whitegrid')
+
+import plotly.express as px
+
+from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import RepeatedKFold
+from sklearn.model_selection import cross_val_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import LeaveOneOut
+from sklearn import metrics
+
+
+na_data = pd.read_csv('2022_january_1/Data/NAmatch.csv', index_col=0)
+```
+
+Our first steps include previewing our data, changing any data types, and our dataset into the 5 datasets.
+    each corresponding to the positions in League of Legends:
+
+- Mid Lane (playmaker)
+- Top Lane (lone wolf)
+- Jungle (captain)
+- ADC (damage dealer)
+- Support (backup)
+
+```{r display data, echo=F, message=F, warning=F}
+DT::datatable(
+  py$na_data[0:9, ], options = list(
+    scrollX=TRUE
+  )
+)
+```
+```{python info data, echo=FALSE, warning=FALSE}
+na_data.info()
+```
+
+We have no null records in any of our features (how lucky), all we have to do is convert our spell variables into datatype object.
+
+```{python split dataset, echo=FALSE, warning=FALSE, display='hide'}
+na_data['f_spell'] = na_data['f_spell'].astype(object)
+na_data['d_spell'] = na_data['d_spell'].astype(object)
+
+support_data = na_data[na_data['role'] == 'Lane.utility']
+adc_data = na_data[na_data['role'] == 'Lane.bot_lane']
+mid_data = na_data[na_data['role'] == 'Lane.mid_lane']
+jungle_data = na_data[na_data['role'] == 'Lane.jungle']
+top_data = na_data[na_data['role'] == 'Lane.top_lane']
+
+```
+
+```{python champions visualization, echo=F, warning=F}
+px.histogram(support_data, x='champion',
+             title='Support Role Champion Distribution').update_xaxes(categoryorder='total descending', type='category')
+px.histogram(adc_data, x='champion',
+             title='ADC Role Champion Distribution').update_xaxes(categoryorder='total descending', type='category')
+px.histogram(mid_data, x='champion',
+             title='Mid Role Champion Distribution').update_xaxes(categoryorder='total descending', type='category')
+px.histogram(jungle_data, x='champion',
+             title='Jungle Role Champion Distribution').update_xaxes(categoryorder='total descending', type='category')
+px.histogram(top_data, x='champion',
+             title='Top Role Champion Distribution').update_xaxes(categoryorder='total descending', type='category')
+```
+
+We will revisit this later, but these graphs act as a snapshot in time for what the best players in North America were playing!
+
+### Support {-}
+
+Our first role we will take a deeper look at is support!
+
+```{python support shape, echo=F, warning=F}
+print(support_data.shape)
+```
+```{r support describe, echo=F, message=F, warning=F}
+py$support_data %>%
+  skim() %>%
+  yank("numeric")
+```
+```{python sup side distribution, echo=F, warning=F}
+px.histogram(support_data,
+             x='side', title='Side distribution').update_xaxes(categoryorder='total descending')
+```
+Very similar side distribution which is good, despite our study using random sampling we still should note side as unequal distributions could ignore the fact that side could play a role.
+
+```{python sup result distribution, echo=F, warning=F}
+px.histogram(support_data,
+             x='side', title='Side distribution').update_xaxes(categoryorder='total descending')
+```
+As we can see here our response variable is a bit imbalanced in favor of losses, thus using the F1 score could be beneficial as it is best for imbalanced datasets. However the difference is not very much (about 40 datapoints) thus using ROC could be our best method of determining model performance.
+
+#### Visualize Correlation {-}
+
+```{python sup correlation, echo=F, warning=F}
+px.imshow(support_data.corr(), text_auto=True, aspect="auto")
+```
+Notable factors with high correlation with our response: assists(0.495), deaths(-0.411), kda(0.542), damage_objectives(0.421)
+
+It is also worth noting that damage_turrets and damage_objectives have a correlation of 1, indicating they must have the same value. Therefore, I will be dropping damage_turrets (could have chosen either).
+
+Also some relationships such as deaths and kda have high correlations, but is explainable as deaths is used in the expression to calculate kda.
+
+However some other values are correlated indicating the possible existence of multi collinearity, which can cause issues with our linear and logistic models further down the line.
+
+```{python support drop cols, echo=FALSE, warning=FALSE, display='hide'}
+support_data_final = support_data.drop(['damage_turrets', 'champion','role', 'd_spell', 'f_spell'], axis=1)
+```
+
+#### Data Preprocessing {-}
+
+Since we have no missing values there is no need to change any values. We will only be Label Encoding our categorical variables. However we will be removing the champion column (too many levels), d and f spell columns (too many levels), and the role column (we have already split the problem into roles).
+
+```{python support encoding, echo=T, warning=FALSE, display='hide'}
+# Label Encoding
+
+# 1: red side, 0: blue side
+support_data_final['side'] = support_data_final['side'].map({'Side.red': 1, 'Side.blue':0})
+
+# 1: win, 0: loss
+support_data_final['result'] = support_data_final['result'].map({True: 1, False:0})
+```
+
+#### Create Testing and Training Sets {-}
+
+We will be using a 80-20 train-test split
+
+```{python support split, echo=T, warning=FALSE, display='hide'}
+X_support = support_data_final.drop(columns=['result']).values
+Y_support = support_data_final['result'].values
+X_train_suppport, X_test_suppport, Y_train_support, Y_test_support = train_test_split(X_support,Y_support,
+                                                                                      test_size=0.2, random_state=1337)
+
+cv = RepeatedKFold(n_splits=10, n_repeats=3, random_state=1337)
+
+
+```
+
+#### Creating Our Models {-}
+Here we will create three models:
+
+- Logistic Regression
+- Decision Tree
+- Random Forest
+
+##### Logistic Regression {-}
+
+and we will be using the F1 score and Repeated K-Fold Cross Validation to evaluate our models.
+
+```{python support logistic, echo=T, warning=FALSE}
+support_log_model = LogisticRegression(random_state=1337, max_iter=10000)
+support_log_model.fit(X_train_suppport,Y_train_support)
+
+support_log_f1scores = cross_val_score(support_log_model, X_train_suppport, Y_train_support,
+                                       scoring="f1",cv=cv, n_jobs=-1)
+support_log_ROCscores = cross_val_score(support_log_model, X_train_suppport, Y_train_support,
+                                        scoring="roc_auc", cv=cv, n_jobs=-1)
+print('F1: %.3f (%.3f)' % (np.mean(support_log_f1scores), np.std(support_log_f1scores)))
+print('ROC: %.3f (%.3f)' % (np.mean(support_log_ROCscores), np.std(support_log_ROCscores)))
+support_log_ROCscores = cross_val_score(support_log_model, X_train_suppport, Y_train_support,
+                                        scoring="roc_auc", cv=cv, n_jobs=-1)
+
+```
+
+##### Decision Tree {-}
+
+```{python support decision, echo=T, warning=FALSE}
+support_dt_model = DecisionTreeClassifier(criterion = 'entropy', random_state = 1337)
+support_dt_model.fit(X_train_suppport,Y_train_support)
+support_dt_f1scores = cross_val_score(support_dt_model, X_train_suppport, Y_train_support,
+                                      scoring="f1",cv=cv, n_jobs=-1)
+support_dt_ROCscores = cross_val_score(support_dt_model, X_train_suppport, Y_train_support,
+                                       scoring="roc_auc", cv=cv, n_jobs=-1)
+print('F1: %.3f (%.3f)' % (np.mean(support_dt_f1scores), np.std(support_dt_f1scores)))
+print('ROC: %.3f (%.3f)' % (np.mean(support_dt_ROCscores), np.std(support_dt_ROCscores)))
+```
+
+##### Random Forest {-}
+
+```{python support forest, echo=T, warning=FALSE}
+support_rf_model = RandomForestClassifier(criterion = 'entropy', random_state = 1337)
+support_rf_model.fit(X_train_suppport,Y_train_support)
+support_rf_f1scores = cross_val_score(support_rf_model, X_train_suppport, Y_train_support,
+                                      scoring="f1",cv=cv, n_jobs=-1)
+
+support_rf_ROCscores = cross_val_score(support_rf_model, X_train_suppport, Y_train_support,
+                                       scoring="roc_auc", cv=cv, n_jobs=-1)
+print('F1: %.3f (%.3f)' % (np.mean(support_rf_f1scores), np.std(support_rf_f1scores)))
+print('ROC: %.3f (%.3f)' % (np.mean(support_rf_ROCscores), np.std(support_rf_ROCscores)))
+```
+
+##### Predictions {-}
+
+Using cv in our training set we have come to the conclusion, using ROC and F1 scoring, that our Random Forest model performs the best. Therefore, we will use this model on our test set!
+
+```{python support preds, echo=T, warning=FALSE}
+support_rf_model = RandomForestClassifier(criterion = 'entropy', random_state = 1337)
+support_rf_model.fit(X_train_suppport,Y_train_support)
+support_rf_f1scores = cross_val_score(support_rf_model, X_train_suppport, Y_train_support,
+                                      scoring="f1",cv=cv, n_jobs=-1)
+
+support_rf_ROCscores = cross_val_score(support_rf_model, X_train_suppport, Y_train_support,
+                                       scoring="roc_auc", cv=cv, n_jobs=-1)
+print('F1: %.3f (%.3f)' % (np.mean(support_rf_f1scores), np.std(support_rf_f1scores)))
+print('ROC: %.3f (%.3f)' % (np.mean(support_rf_ROCscores), np.std(support_rf_ROCscores)))
+```
+
+##### Feature Importance {-}
+```{python support feature Importance, echo=T, warning=FALSE}
+support_feature_importance=pd.DataFrame({
+    'Random Forest':support_rf_model.feature_importances_,
+    'Decision Tree':support_dt_model.feature_importances_,
+    'Logistic Regression':[abs(i) for i in support_log_model.coef_[0]]
+},index=support_data_final.drop(columns=['result']).columns)
+support_feature_importance.sort_values(by='Random Forest',ascending=True,inplace=True)
+
+support_feature_importance.plot(kind='barh',figsize=(12,10), width=.85, colormap='Paired', fontsize=15)
+```
+
+It looks like all three models placed high emphasis on KDA, with decision tree placing the most. The logistic regression model places deaths as an important feature, as well as level, assists and kills.
+
+# Wrap-Up {-}
+
+I will end it here for this write-up, as I have a more detailed article linked below detailing each region and position! It would be too long!
+
+If you would like to dig further into the code, please view the repository below!
+
+Thank you :)
+
+# Links {-}
+
+- [Analysis Repo](https://github.com/aasuter/LoLWinrateModeling)
+- [Gathering Repo](https://github.com/aasuter/LoLDataWrangling)
+- [Medium Article](https://medium.com/@andrewasuter/league-of-legends-data-modeling-324332ca9cb5)
+- [LinkedIn](https://www.linkedin.com/in/andrew-a-suter/)
+- [Website](https://aasuter.com)
+
